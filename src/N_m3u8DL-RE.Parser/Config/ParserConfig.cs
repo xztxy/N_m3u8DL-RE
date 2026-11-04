@@ -1,4 +1,4 @@
-﻿using N_m3u8DL_RE.Common.Enum;
+using N_m3u8DL_RE.Common.Enum;
 using N_m3u8DL_RE.Parser.Processor;
 using N_m3u8DL_RE.Parser.Processor.DASH;
 using N_m3u8DL_RE.Parser.Processor.HLS;
@@ -47,6 +47,18 @@ public class ParserConfig
     /// 自定义的解密IV
     /// </summary>
     public byte[]? CustomeIV { get; set; }
+
+    public CustomHlsScope CustomHLSScope { get; set; } = CustomHlsScope.ALL;
+
+    internal ParserConfig WithoutCustomHLSOverrides()
+    {
+        // 保留同一次解析的处理器和请求设置，只移除当前媒体流不适用的覆盖值。
+        var config = (ParserConfig)MemberwiseClone();
+        config.CustomMethod = null;
+        config.CustomeKey = null;
+        config.CustomeIV = null;
+        return config;
+    }
 
     /// <summary>
     /// 组装视频分段的URL时，是否要把原本URL后的参数也加上去

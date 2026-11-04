@@ -10,9 +10,10 @@ using N_m3u8DL_RE.Common.Enum;
 
 namespace N_m3u8DL_RE.Parser;
 
-public class StreamExtractor
+public class StreamExtractor : IDisposable
 {
     public ExtractorType ExtractorType => extractor.ExtractorType;
+    public WebSourceResult? DirectSource { get; private set; }
     private IExtractor extractor;
     private ParserConfig parserConfig = new();
     private string rawText;
@@ -27,6 +28,8 @@ public class StreamExtractor
 
     public async Task LoadSourceFromUrlAsync(string url)
     {
+        DirectSource?.Dispose();
+        DirectSource = null;
         Logger.Info(ResString.loadingUrl + url);
         if (url.StartsWith("file:"))
         {
@@ -37,7 +40,22 @@ public class StreamExtractor
         else if (url.StartsWith("http"))
         {
             parserConfig.OriginalUrl = url;
-            (this.rawText, url) = await HTTPUtil.GetWebSourceAndNewUrlAsync(url, parserConfig.Headers);
+            var result = await HTTPUtil.GetWebSourceResultAsync(url, parserConfig.Headers);
+            this.rawText = result.Source;
+            if (this.rawText == ResString.ReLiveTs && result.Response?.Content.Headers.ContentLength is not null)
+            {
+                this.rawText = ResString.ReBinaryData;
+            }
+            url = result.Url;
+            if ((this.rawText == ResString.ReBinaryData || this.rawText == ResString.ReLiveTs) &&
+                result.Response != null)
+            {
+                DirectSource = result;
+            }
+            else
+            {
+                result.Dispose();
+            }
             parserConfig.Url = url;
         }
         else if (File.Exists(url))
@@ -46,17 +64,29 @@ public class StreamExtractor
             this.rawText = await File.ReadAllTextAsync(url);
             parserConfig.OriginalUrl = parserConfig.Url = new Uri(url).AbsoluteUri;
         }
+
+        if (string.IsNullOrWhiteSpace(rawText))
+        {
+            throw new Exception(ResString.loadUrlFailed);
+        }
+        
         this.rawText = rawText.Trim();
         LoadSourceFromText(this.rawText);
     }
 
-    [MemberNotNull(nameof(this.rawText), nameof(this.extractor))]
+    [MemberNotNull(nameof(rawText), nameof(extractor))]
     private void LoadSourceFromText(string rawText)
     {
         var rawType = "txt";
         rawText = rawText.Trim();
         this.rawText = rawText;
-        if (rawText.StartsWith(HLSTags.ext_m3u))
+        if (rawText.StartsWith(HLSTags.ext_m3u) && IPTVExtractor.IsPlaylist(rawText))
+        {
+            Logger.InfoMarkUp(ResString.matchIPTV);
+            extractor = new IPTVExtractor(parserConfig);
+            rawType = "m3u";
+        }
+        else if (rawText.StartsWith(HLSTags.ext_m3u))
         {
             Logger.InfoMarkUp(ResString.matchHLS);
             extractor = new HLSExtractor(parserConfig);
@@ -81,6 +111,11 @@ public class StreamExtractor
             Logger.InfoMarkUp(ResString.matchTS);
             extractor = new LiveTSExtractor(parserConfig);
         }
+        else if (rawText == ResString.ReBinaryData)
+        {
+            Logger.InfoMarkUp(ResString.matchBinaryData);
+            extractor = new BinaryExtractor(parserConfig);
+        }
         else
         {
             throw new NotSupportedException(ResString.notSupported);
@@ -88,6 +123,22 @@ public class StreamExtractor
 
         RawFiles[$"raw.{rawType}"] = rawText;
     }
+
+    /// <summary>
+    /// 仅连接选中的 IPTV 频道，保留识别时读取的前缀；调用者负责释放独立的响应流。
+    /// </summary>
+    public async Task<WebSourceResult> LoadLiveSourceAsync(StreamSpec stream, CancellationToken cancellationToken = default)
+    {
+        if (!Uri.TryCreate(stream.Url, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
+            throw new NotSupportedException($"{ResString.iptvHttpRequired}: {stream.Url}");
+        var source = await HTTPUtil.GetWebSourceResultAsync(stream.Url, parserConfig.Headers, cancellationToken);
+        if (source.Source == ResString.ReLiveTs && source.Stream != null)
+            return source;
+        source.Dispose();
+        throw new NotSupportedException($"{ResString.iptvTsRequired}: {stream.Url}");
+    }
+
+    public void Dispose() => DirectSource?.Dispose();
 
     /// <summary>
     /// 开始解析流媒体信息
@@ -125,16 +176,13 @@ public class StreamExtractor
         }
     }
 
-    public async Task RefreshPlayListAsync(List<StreamSpec> streamSpecs)
+    public async Task RefreshPlayListAsync(List<StreamSpec> streamSpecs, CancellationToken cancellationToken = default, TimeSpan? requestTimeout = null)
     {
+        await semaphore.WaitAsync(cancellationToken);
         try
         {
-            await semaphore.WaitAsync();
-            await RetryUtil.WebRequestRetryAsync(async () =>
-            {
-                await extractor.RefreshPlayListAsync(streamSpecs);
-                return true;
-            }, retryDelayMilliseconds: 1000, maxRetries: 5);
+            // 直播录制器负责持续重试和停止条件；这里保留原异常，避免网络故障被包装后无法识别。
+            await extractor.RefreshPlayListAsync(streamSpecs, cancellationToken, requestTimeout);
         }
         finally
         {

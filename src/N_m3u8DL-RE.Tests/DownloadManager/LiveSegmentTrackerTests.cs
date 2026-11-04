@@ -1,0 +1,197 @@
+using N_m3u8DL_RE.Common.Entity;
+using N_m3u8DL_RE.Common.Util;
+using N_m3u8DL_RE.DownloadManager;
+using Shouldly;
+using System.Text.Json;
+
+namespace N_m3u8DL_RE.Tests.DownloadManager;
+
+public class LiveSegmentTrackerTests
+{
+    [Fact]
+    public void HlsSequenceChangesWarnOnceAndIgnoreNormalWindowsAndRecordingFilters()
+    {
+        var tracker = new LiveSegmentTracker();
+        var initial = new[] { Segment(742195, "old/195?token=a"), Segment(742196, "old/196?token=a") }.ToList();
+        Assert.Null(tracker.ObserveHlsSequence(initial));
+        tracker.Record([initial[0]]); // 模拟广告或范围过滤，与观测到的源窗口分开。
+        Assert.Null(tracker.ObserveHlsSequence(
+            [Segment(742196, "old/196?token=b"), Segment(742197, "old/197?token=b")]));
+        Assert.Null(tracker.ObserveHlsSequence([Segment(742198, "old/198")]));
+
+        var reset = Enumerable.Range(0, 8).Select(i => Segment(i, $"reset/{i}")).ToList();
+        Assert.Equal((742198L, 0L), tracker.ObserveHlsSequence(reset));
+        Assert.Null(tracker.ObserveHlsSequence(reset));
+        Assert.Null(tracker.ObserveHlsSequence([Segment(6, "reset/6"), Segment(7, "reset/7"), Segment(8, "reset/8")]));
+        Assert.Null(tracker.ObserveHlsSequence([]));
+        var resumed = new[] { Segment(742203, "resumed/203"), Segment(742204, "resumed/204") }.ToList();
+        Assert.Equal((8L, 742203L), tracker.ObserveHlsSequence(resumed));
+        Assert.Null(tracker.ObserveHlsSequence(resumed));
+    }
+
+    [Fact]
+    public void DashQueryTemplateStillMatchesWhenSignatureChanges()
+    {
+        var tracker = new LiveSegmentTracker();
+        tracker.Record([new MediaSegment { Url = "https://example.com/media?t=100&token=old", NameFromVar = "100" }]);
+        var refreshed = new List<MediaSegment>
+        {
+            new() { Url = "https://example.com/media?t=100&token=new", NameFromVar = "100" },
+            new() { Url = "https://example.com/media?t=102&token=new", NameFromVar = "102" },
+        };
+        Assert.Equal([refreshed[1]], tracker.Filter(refreshed, false));
+        refreshed.Insert(1, new MediaSegment { Url = "https://example.com/media?t=100&token=other", NameFromVar = "100" });
+        Assert.Equal(refreshed, tracker.Filter(refreshed, false));
+    }
+
+    [Fact]
+    public void DashPeriodWithResetTemplateNumbersDoesNotMatchOldSegment()
+    {
+        var tracker = new LiveSegmentTracker();
+        tracker.Record([new MediaSegment { Url = "https://example.com/old/2.m4s", NameFromVar = "2" }]);
+        var refreshed = new List<MediaSegment>
+        {
+            new() { Url = "https://example.com/new/1.m4s", NameFromVar = "1" },
+            new() { Url = "https://example.com/new/2.m4s", NameFromVar = "2" },
+        };
+        Assert.Equal(refreshed, tracker.Filter(refreshed, false));
+    }
+
+    [Fact]
+    public void SequenceReset_KeepsSourceIndexesAndUniqueRecordingFiles()
+    {
+        var tracker = new LiveSegmentTracker();
+        var first = new[] { Segment(98, "old/98"), Segment(99, "old/99"), Segment(100, "old/100") }.ToList();
+        tracker.Record(first);
+
+        // 刷新列表中有旧片段，媒体序号却已从 1 重新开始。
+        var overlap = new[] { Segment(1, "old/99"), Segment(2, "old/100"), Segment(3, "new/1"), Segment(4, "new/2") }.ToList();
+        var second = tracker.Filter(overlap, true);
+        second.Select(s => s.Url).ShouldBe(new[] { "new/1", "new/2" });
+        tracker.Record(second);
+        second.Select(s => s.Index).ShouldBe(new long[] { 3, 4 });
+
+        // 上一片已经滑出列表时，也要继续使用新的录制顺序。
+        var reset = new[] { Segment(1, "reset/1"), Segment(2, "reset/2") }.ToList();
+        var third = tracker.Filter(reset, true);
+        tracker.Record(third);
+        third.Select(s => s.Index).ShouldBe(new long[] { 1, 2 });
+
+        var recorded = first.Concat(second).Concat(third).ToList();
+        recorded.Select(s => s.RecordingIndex).ShouldBe(Enumerable.Range(1, recorded.Count).Select(i => (long?)i));
+        recorded.Select(s => LiveSegmentTracker.GetFileName(s, s.Index.ToString())).Distinct().Count().ShouldBe(recorded.Count);
+        recorded.ToHashSet().Count.ShouldBe(recorded.Count);
+    }
+
+    [Fact]
+    public void ReusedIndexWithDifferentUrl_DoesNotMatchOldSegment()
+    {
+        var tracker = new LiveSegmentTracker();
+        tracker.Record(new[] { Segment(3, "old/3") }.ToList());
+
+        var reset = new[] { Segment(1, "new/1"), Segment(2, "new/2"), Segment(3, "new/3") }.ToList();
+        tracker.Filter(reset, true).ShouldBe(reset);
+    }
+
+    [Fact]
+    public void ReusedUrls_DoNotMoveOverlapPastRecordedSourceIndex()
+    {
+        var tracker = new LiveSegmentTracker();
+        tracker.Record(new[] { Segment(12, "A.ts") }.ToList());
+
+        var refreshed = new[]
+        {
+            Segment(11, "B.ts"), Segment(12, "A.ts"),
+            Segment(13, "B.ts"), Segment(14, "A.ts")
+        }.ToList();
+        var newSegments = tracker.Filter(refreshed, true);
+
+        newSegments.Select(s => s.Index).ShouldBe(new long[] { 13, 14 });
+    }
+
+    [Fact]
+    public void ReusedUrlsWithResetIndex_DoNotGuessAmbiguousOverlap()
+    {
+        var tracker = new LiveSegmentTracker();
+        tracker.Record(new[] { Segment(100, "A.ts") }.ToList());
+
+        var reset = new[]
+        {
+            Segment(1, "B.ts"), Segment(2, "A.ts"),
+            Segment(3, "B.ts"), Segment(4, "A.ts")
+        }.ToList();
+
+        tracker.Filter(reset, true).ShouldBe(reset);
+    }
+
+    [Fact]
+    public void SameTimestamp_UsesUrlToFindOverlap()
+    {
+        var tracker = new LiveSegmentTracker();
+        var dateTime = new DateTime(2026, 9, 28, 12, 0, 0, 1, DateTimeKind.Utc);
+        var old = Segment(10, "old/10", dateTime);
+        tracker.Record(new[] { old }.ToList());
+
+        var refreshed = new[] { Segment(1, "old/10", dateTime), Segment(2, "new/2", dateTime) }.ToList();
+        tracker.Filter(refreshed, true).Select(s => s.Url).ShouldBe(new[] { "new/2" });
+    }
+
+    [Fact]
+    public void SameTimestampWithChangedSignature_DoesNotSkipFollowingSegment()
+    {
+        var tracker = new LiveSegmentTracker();
+        var dateTime = new DateTime(2026, 9, 28, 12, 0, 0, 1, DateTimeKind.Utc);
+        tracker.Record(new[] { Segment(12, "https://example.com/A.ts?token=old", dateTime) }.ToList());
+
+        var refreshed = new[]
+        {
+            Segment(12, "https://example.com/A.ts?token=new", dateTime),
+            Segment(13, "https://example.com/B.ts?token=new", dateTime)
+        }.ToList();
+
+        tracker.Filter(refreshed, true)
+            .Select(s => s.Index).ShouldBe(new long[] { 13 });
+    }
+
+    [Fact]
+    public void ChangedSignature_FindsOverlapByPathAndSourceIndex()
+    {
+        var tracker = new LiveSegmentTracker();
+        tracker.Record(new[] { Segment(20, "https://example.com/20.ts?token=old") }.ToList());
+
+        var refreshed = new[]
+        {
+            Segment(20, "https://example.com/20.ts?token=new"),
+            Segment(21, "https://example.com/21.ts?token=new")
+        }.ToList();
+        tracker.Filter(refreshed, true).Select(s => s.Index).ShouldBe(new long[] { 21 });
+    }
+
+    [Fact]
+    public void RepeatedSourceIdentity_HasDistinctDictionaryKeysAndFileNames()
+    {
+        var tracker = new LiveSegmentTracker();
+        var first = Segment(1, "segment.ts");
+        var second = Segment(1, "segment.ts");
+        tracker.Record(new[] { first }.ToList());
+        tracker.Record(new[] { second }.ToList());
+
+        first.Equals(second).ShouldBeFalse();
+        new Dictionary<MediaSegment, string> { [first] = "old", [second] = "new" }.Count.ShouldBe(2);
+        LiveSegmentTracker.GetFileName(first, "1").ShouldNotBe(LiveSegmentTracker.GetFileName(second, "1"));
+
+        var json = GlobalUtil.ConvertToJson(new List<MediaSegment> { first, second });
+        using var document = JsonDocument.Parse(json);
+        document.RootElement.EnumerateArray().Select(item => item.EnumerateObject()
+            .Single(property => property.Name.Equals("Index", StringComparison.OrdinalIgnoreCase)).Value.GetInt64())
+            .ShouldBe(new long[] { 1, 1 });
+        json.ToLowerInvariant().ShouldNotContain("recordingindex");
+    }
+
+    private static MediaSegment Segment(long index, string url, DateTime? dateTime = null) => new()
+    {
+        Index = index,
+        Url = url,
+        DateTime = dateTime,
+    };
+}

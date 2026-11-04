@@ -29,7 +29,7 @@ internal static class LargeSingleFileSplitUtil
         long fileSize = await GetFileSizeAsync(url, headers);
         if (fileSize == 0) return null;
 
-        List<Clip> allClips = GetAllClips(url, fileSize);
+        List<Clip> allClips = GetAllClips(fileSize);
         var splitSegments = new List<MediaSegment>();
         foreach (Clip clip in allClips)
         {
@@ -50,8 +50,13 @@ internal static class LargeSingleFileSplitUtil
     {
         try
         {
-            var request = new HttpRequestMessage(HttpMethod.Head, url);
-            var response = (await HTTPUtil.AppHttpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead)).EnsureSuccessStatusCode();
+            using var request = HTTPUtil.CreateRequest(HttpMethod.Head, url);
+            foreach (var header in headers)
+            {
+                request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+            }
+            using var response = await HTTPUtil.AppHttpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
             bool supportsRangeRequests = response.Headers.Contains("Accept-Ranges");
 
             return supportsRangeRequests;
@@ -65,21 +70,22 @@ internal static class LargeSingleFileSplitUtil
 
     private static async Task<long> GetFileSizeAsync(string url, Dictionary<string, string> headers)
     {
-        using var httpRequestMessage = new HttpRequestMessage();
-        httpRequestMessage.RequestUri = new(url);
+        using var httpRequestMessage = HTTPUtil.CreateRequest(HttpMethod.Head, url);
         foreach (var header in headers)
         {
             httpRequestMessage.Headers.TryAddWithoutValidation(header.Key, header.Value);
         }
-        var response = (await HTTPUtil.AppHttpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead)).EnsureSuccessStatusCode();
+        using var response = await HTTPUtil.AppHttpClient.SendAsync(httpRequestMessage, HttpCompletionOption.ResponseHeadersRead);
+        response.EnsureSuccessStatusCode();
         long totalSizeBytes = response.Content.Headers.ContentLength ?? 0;
 
         return totalSizeBytes;
     }
 
     // 此函数主要是切片下载逻辑
-    private static List<Clip> GetAllClips(string url, long fileSize)
+    private static List<Clip> GetAllClips(long fileSize)
     {
+        long originalFileSize = fileSize;
         List<Clip> clips = [];
         int index = 0;
         long counter = 0;
@@ -103,7 +109,7 @@ internal static class LargeSingleFileSplitUtil
             // 已到最后
             else
             {
-                c.To = -1;
+                c.To = originalFileSize;
                 clips.Add(c);
                 break;
             }

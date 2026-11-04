@@ -1,4 +1,5 @@
 ﻿using Spectre.Console;
+using Spectre.Console.Rendering;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -42,14 +43,8 @@ public static partial class Logger
             var now = DateTime.Now;
             if (string.IsNullOrEmpty(LogFilePath))
             {
-                LogFilePath = Path.Combine(logDir, now.ToString("yyyy-MM-dd_HH-mm-ss-fff") + ".log");
-                int index = 1;
-                var fileName = Path.GetFileNameWithoutExtension(LogFilePath);
-                // 若文件存在则加序号
-                while (File.Exists(LogFilePath))
-                {
-                    LogFilePath = Path.Combine(Path.GetDirectoryName(LogFilePath)!, $"{fileName}-{index++}.log");
-                }
+                // 原子地占用一个唯一的日志文件名，避免多个进程在同一毫秒内选中相同文件名而冲突
+                LogFilePath = ClaimAutoLogFile(logDir, now);
             }
 
             string init = "LOG " + now.ToString("yyyy/MM/dd") + Environment.NewLine
@@ -65,9 +60,63 @@ public static partial class Logger
         }
     }
 
+    /// <summary>
+    /// 以独占方式创建并占用一个唯一的日志文件，返回其完整路径。
+    /// 若文件名已被占用（例如另一个进程在同一毫秒内启动）则递增序号后重试，
+    /// 从而消除“先判断存在再创建”所带来的竞态。
+    /// </summary>
+    internal static string ClaimAutoLogFile(string logDir, DateTime now)
+    {
+        var baseName = now.ToString("yyyy-MM-dd_HH-mm-ss-fff");
+        var fileName = baseName;
+        var index = 1;
+        while (true)
+        {
+            var path = Path.Combine(logDir, fileName + ".log");
+            try
+            {
+                // CreateNew 在文件已存在时会抛出 IOException，借此原子地占用文件名
+                using (new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.ReadWrite)) { }
+                return path;
+            }
+            catch (IOException) when (File.Exists(path))
+            {
+                // 该文件名已被占用，换一个序号继续尝试
+                fileName = $"{baseName}-{index++}";
+            }
+        }
+    }
+
     private static string GetCurrTime()
     {
         return DateTime.Now.ToString("HH:mm:ss.fff");
+    }
+
+    private sealed class PlainLogLine(string prefix, string message, bool noAnsiOutput) : Renderable
+    {
+        private readonly IRenderable prefixMarkup = new Markup(prefix);
+        // 普通日志正文按原始文本处理，保留方括号和 :emoji: 等内容，不解释为 markup。
+        private readonly IRenderable body = new Text(message);
+
+        protected override IEnumerable<Segment> Render(RenderOptions options, int maxWidth)
+        {
+            if (noAnsiOutput)
+            {
+                var line = prefix.RemoveMarkup() + message + Environment.NewLine;
+                // 控制段跳过 ANSI 后端的文本分行，让 NonAnsiWriter 一次收到整条日志，
+                // 保留正文空行和缩进；非 ANSI 后端直接写出普通文本段。
+                yield return options.Ansi ? Segment.Control(line) : new Segment(line);
+                yield break;
+            }
+
+            // 只取消日志的硬折行，不修改全局终端宽度，进度条仍按实际宽度布局。
+            // 终端自行做视觉折行，鼠标复制长 URL 时不会带入额外的换行符。
+            foreach (var segment in prefixMarkup.Render(options, int.MaxValue))
+                yield return segment;
+            foreach (var segment in body.Render(options, int.MaxValue))
+                yield return segment;
+            yield return Segment.LineBreak;
+        }
     }
 
     private static void HandleLog(string write, string subWrite = "")
@@ -80,8 +129,9 @@ public static partial class Logger
             }
             else
             {
-                CustomAnsiConsole.Markup(write);
-                Console.WriteLine(subWrite);
+                // 前缀和正文必须在同一次渲染中输出，避免正文绕过进度条的光标管理。
+                var console = CustomAnsiConsole.Console;
+                console.Write(new PlainLogLine(write, subWrite, console.Profile.Out.Writer is NonAnsiWriter));
             }
 
             if (!IsWriteFile || !File.Exists(LogFilePath)) return;
@@ -91,10 +141,8 @@ public static partial class Logger
             {
                 // 进入写入
                 LogWriteLock.EnterWriteLock();
-                using (StreamWriter sw = File.AppendText(LogFilePath))
-                {
-                    sw.WriteLine(plain);
-                }
+                using StreamWriter sw = new StreamWriter(LogFilePath, append: true, Encoding.UTF8);
+                sw.WriteLine(plain);
             }
             finally
             {
@@ -216,10 +264,8 @@ public static partial class Logger
         {
             // 进入写入
             LogWriteLock.EnterWriteLock();
-            using (StreamWriter sw = File.AppendText(LogFilePath))
-            {
-                sw.WriteLine(plain, Encoding.UTF8);
-            }
+            using StreamWriter sw = new StreamWriter(LogFilePath, append: true, Encoding.UTF8);
+            sw.WriteLine(plain);
         }
         finally
         {
